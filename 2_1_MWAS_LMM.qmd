@@ -1,0 +1,295 @@
+---
+title: "MWAS analysis"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format: 
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+```{r}
+#| echo: false
+
+options(scipen=999)
+
+source(fs::path(here::here(),"2_longitudinal_metabolomics","!libraries.R"))
+source(fs::path(here::here(),"2_longitudinal_metabolomics","!directories.R"))
+source(fs::path(here::here(),"2_longitudinal_metabolomics","!functions.R"))
+
+library(nlme)
+library(doParallel)
+library(foreach)
+library(kableExtra)
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+#| label: shorten-long-path
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive)
+{
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path))
+}
+
+if(nchar(dir_data) > 80)
+{
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+  
+  dir_objects_names <- ls(pattern = "^dir_")
+  
+  dir_list <- mget(dir_objects_names)
+  
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)  
+}
+
+rm(dir_objects_names, short_cut, dir_list, dir_list_shortened)
+```
+
+## Model Parameters
+
+```{r}
+chemical_names <- c("PFOS", "PFHxS", "PFHpS", "PFOA", "PFNA", "PFDA", "PFHpA", "PFUnDa")
+
+chemical_variables <- c(
+  "pfos_untargeted_plasma",
+  "pf_hx_s_untargeted_plasma",
+  "pf_hp_s_untargeted_plasma",
+  "pfoa_untargeted_plasma",
+  "pfna_untargeted_plasma",
+  "pfda_untargeted_plasma",
+  "pf_hp_a_untargeted_plasma",
+  "pf_ud_a_untargeted_plasma"
+)
+
+covariates <- c("age_baseline", "sex", "race_binary", "parents_income_new", "site")
+
+mix_variables <- c(
+  "PFAS_burden_deciles_summed",
+  "pfas_sulfonic_acids",
+  "pfas_carboxylic_acids"
+)
+```
+
+## Data Loading
+
+```{r load data}
+load(
+  fs::path(
+    dir_data,
+    "tl_long_met_untargeted_pfas_workdata.RData"
+  )
+)
+
+platforms <- names(met_fts_final)
+```
+
+## LMM-based MWAS
+
+```{r}
+#| eval: false
+
+start_time <- Sys.time()
+
+lmm_random_intercept_knot1_covars_PFAS_output <- {}
+for(i in 1:length(platforms))
+{
+  print(i)
+  model_df <- met_fts_final[[i]] %>% 
+    dplyr::select(-key, -visit)
+  covariates_df <- tl_final[,covariates]
+  key <- tl_final$key
+  visit <- tl_final$visit_year
+    
+  output_by_chemical <- {}
+  for(k in 1:length(chemical_variables))
+  {
+    print(chemical_variables[k])
+    x <- tl_final[,chemical_variables[k]]
+    cl <- makeCluster(detectCores()-2)
+    registerDoParallel(cl)
+    model_output <- foreach(j = 1:dim(model_df)[2], .combine = rbind, .packages = c("nlme")) %dopar%
+      fit_lmm_random_intercept_covars_JT(x = x, y = model_df[,j], key = key, visit = visit, covariates_df)
+    stopCluster(cl)
+    
+    model_output <- model_output %>%
+      as.data.frame %>%
+      mutate_at(vars(coef, se, statistic, pvalue, pvalue_interaction, L_ratio), as.numeric)
+    
+    model_output$feature <- rep(colnames(model_df), each = 2)
+    
+    model_output$p_adjust_interaction <- p.adjust(model_output$pvalue_interaction, method = "BH")
+    
+    output_by_chemical[[k]] <- model_output
+    
+    rm(model_output, x)
+  }
+  
+  lmm_random_intercept_knot1_covars_PFAS_output[[i]] <- output_by_chemical |>
+    bind_rows()
+  
+  rm(output_by_chemical, model_df)
+}
+names(lmm_random_intercept_knot1_covars_PFAS_output) <- platforms
+
+save(lmm_random_intercept_knot1_covars_PFAS_output,
+     file = fs::path(
+       dir_results |> dirname(), 
+       "1_code",
+       "2_longitudinal_metabolomics",
+       "temp_data",
+       "model_statistics_untargeted_PFAS_longitudinal_metabo.RData"))
+
+end_time <- Sys.time()
+end_time - start_time
+```
+
+```{r}
+load(
+  fs::path(
+    dir_results |> dirname(),
+    "1_code",
+    "2_longitudinal_metabolomics",
+    "temp_data",
+    "model_statistics_untargeted_PFAS_longitudinal_metabo.RData"
+  )
+)
+```
+
+## Summary
+
+### Raw p-values \< 0.05
+
+```{r}
+sig_list <- lapply(
+  lmm_random_intercept_knot1_covars_PFAS_output,
+  function(df) get_sig_by_chemical(df, "pvalue", 0.05)
+) |>
+  modify2(
+    names(lmm_random_intercept_knot1_covars_PFAS_output),
+    ~ .x %>% 
+      dplyr::mutate(mode = .y)
+  ) |>
+  bind_rows() %>% 
+  dplyr::mutate(
+    exposure = factor(exposure, levels = chemical_variables)
+  ) %>% 
+  dplyr::arrange(mode, exposure)
+
+sig_list$PFAS <- chemical_names[match(sig_list$exposure, chemical_variables)]
+```
+
+```{r}
+sig_list %>% 
+  dplyr::select(mode, PFAS, pvalue) |>
+  kbl(
+    col.names = c("Mode", "PFAS chemicals", "# of Sig (p < 0.05)")
+  ) |>
+  kable_paper("hover")
+```
+
+### PCA-corrected p-values
+
+```{r get mode-wide adjusted p-values}
+#| eval: false
+
+p_threshold_pca <- modify(
+  met_fts_final,
+  ~ {
+    pca_mwas <- prcomp(.x[,-c(1:2)])
+    eigenvalues_mwas <- pca_mwas$sdev^2
+    M_eff_mwas <- sum(eigenvalues_mwas > 1)
+    0.05/M_eff_mwas
+  }
+)
+
+# return adjusted p threshold 0.000085
+```
+
+```{r}
+sig_list <- lapply(
+  lmm_random_intercept_knot1_covars_PFAS_output,
+  function(df) get_sig_JT_by_chemical(df, "pvalue_interaction", 0.000085)
+) |>
+  modify2(
+    names(lmm_random_intercept_knot1_covars_PFAS_output),
+    ~ .x %>% 
+      dplyr::mutate(mode = .y)
+  ) |>
+  bind_rows() %>% 
+  dplyr::mutate(
+    exposure = factor(exposure, levels = chemical_variables)
+  ) %>% 
+  dplyr::arrange(mode, exposure)
+
+sig_list$PFAS <- chemical_names[match(sig_list$exposure, chemical_variables)]
+```
+
+```{r}
+sig_list %>% 
+  dplyr::select(mode, PFAS, pvalue_interaction) |>
+  kbl(
+    col.names = c("Mode", "PFAS chemicals", "# of Sig (nominal p < 0.000085)")
+  ) |>
+  kable_paper("hover")
+```
+
+```{r}
+sig_list %>% 
+  dplyr::select(mode, PFAS, pvalue_interaction) %>% 
+  dplyr::group_by(PFAS) %>% 
+  dplyr::reframe(sum = sum(pvalue_interaction, na.rm = T))
+```
+
+## Manuscript
+
+I will use nominal p values first with 0.000085 as thresholds.
+
+```{r extract significant features}
+sig_feature_list <- lapply(
+  lmm_random_intercept_knot1_covars_PFAS_output,
+  function(df) get_sig_JT_features_by_chemical(df, "pvalue_interaction", 0.000085)
+)
+
+saveRDS(
+  sig_feature_list,
+  file = fs::path(
+    dir_results |> dirname(),
+    "1_code",
+    "2_longitudinal_metabolomics",
+    "temp_data",
+    "sig_JT_feature_by_chemical_pca_corrected.rds"
+  )
+)
+```

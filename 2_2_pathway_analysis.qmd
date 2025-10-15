@@ -1,0 +1,192 @@
+---
+title: "Pathway analysis"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format: 
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+```{r}
+#| echo: false
+
+options(scipen=999)
+
+source(fs::path(here::here(),"2_longitudinal_metabolomics","!libraries.R"))
+source(fs::path(here::here(),"2_longitudinal_metabolomics","!directories.R"))
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+#| label: shorten-long-path
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive)
+{
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path))
+}
+
+if(nchar(dir_data) > 80)
+{
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+  
+  dir_objects_names <- ls(pattern = "^dir_")
+  
+  dir_list <- mget(dir_objects_names)
+  
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)  
+}
+
+rm(dir_objects_names, short_cut, dir_list, dir_list_shortened)
+```
+
+## Model Parameters
+
+```{r}
+chemical_names <- c("PFOS", "PFHxS", "PFHpS", "PFOA", "PFNA", "PFDA", "PFHpA", "PFUnDa")
+
+chemical_variables <- c(
+  "pfos_untargeted_plasma",
+  "pf_hx_s_untargeted_plasma",
+  "pf_hp_s_untargeted_plasma",
+  "pfoa_untargeted_plasma",
+  "pfna_untargeted_plasma",
+  "pfda_untargeted_plasma",
+  "pf_hp_a_untargeted_plasma",
+  "pf_ud_a_untargeted_plasma"
+)
+covariates <- c("age_baseline", "sex", "race_binary", "parents_income_new", "site")
+
+q_cutoff_sig_feat <- 0.2
+q_cutoff_sig_feat_pca <- 0.000085
+```
+
+## Data Loading
+
+```{r load data}
+load(
+  fs::path(
+    dir_results |> dirname(), 
+    "1_code",
+    "2_longitudinal_metabolomics",
+    "temp_data",
+    "model_statistics_untargeted_PFAS_longitudinal_metabo.RData")
+)
+
+platforms <- names(lmm_random_intercept_knot1_covars_PFAS_output)
+```
+
+## Pathway Analysis
+
+```{r}
+for(i in 1:length(platforms))
+{
+  for(j in 1:length(chemical_variables))
+  {
+    mum_wkpath <- fs::path(
+      dir_results |> dirname(),
+      "1_code",
+      "2_longitudinal_metabolomics",
+      "temp_data",
+      "Mummichog",
+      paste0(platforms[i], "_", chemical_names[j])
+    )
+    
+    if(file.exists(mum_wkpath)){
+      do.call(function(x) unlink(x, recursive = T), list(list.files(mum_wkpath, full.names = T)))
+    }else{
+      dir.create(mum_wkpath)
+    }
+    
+    mum_input <- lmm_random_intercept_knot1_covars_PFAS_output[[i]] %>% 
+      dplyr::filter(exposure == chemical_variables[j]) %>% 
+      dplyr::group_by(feature) %>% 
+      dplyr::slice(1) %>% 
+      dplyr::ungroup() %>% 
+      dplyr::select(feature, pvalue_interaction, L_ratio)
+    mum_input$mz <- as.numeric(sub('_.*', '', mum_input$feature))
+    mum_input$rt <- as.numeric(sub('.*_', '', mum_input$feature))
+    mum_input <- mum_input %>%
+      dplyr::select(mz, rt, pvalue_interaction, L_ratio)
+    colnames(mum_input) <- c("mz", "rtime", "p-value", "t-score")
+    
+    write.table(
+      mum_input,
+      fs::path(
+        mum_wkpath,
+        paste0("sum_table_", chemical_variables[j], "_", platforms[i], ".txt")
+      ),
+      quote = F, row.names = F, sep = "\t"
+    ) 
+  }
+}
+
+```
+
+```{r}
+start_time <- Sys.time()
+
+for(i in 1:length(platforms))
+{
+  for(j in 1:length(chemical_variables))
+  {
+    mum_wkpath <- fs::path(
+      dir_results |> dirname(),
+      "1_code",
+      "2_longitudinal_metabolomics",
+      "temp_data",
+      "Mummichog",
+      paste0(platforms[i], "_", chemical_names[j])
+    )
+    
+    feat_table_name <- platforms[i]
+    if(grepl("neg", feat_table_name))
+    {
+      mode <- "negative"
+    }else{
+      mode <- "positive"
+    }
+    
+    cmd_code <- paste("python -m mummichog.main -f",
+                      paste0("sum_table_", chemical_variables[j], "_", platforms[i], ".txt"),
+                      "-p 500 -c ", q_cutoff_sig_feat_pca, " -m ", mode, " -z TRUE")
+    print(cmd_code)
+    setwd(mum_wkpath)
+    system(cmd_code)
+  }
+}
+
+end_time <- Sys.time()
+end_time - start_time
+```
